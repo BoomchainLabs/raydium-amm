@@ -28,21 +28,13 @@ use solana_program::{
     program_pack::Pack,
     pubkey::Pubkey,
     rent::Rent,
-    system_instruction,
     sysvar::Sysvar,
 };
+use solana_system_interface::instruction as system_instruction;
 
 use super::log::*;
 use arrform::{arrform, ArrForm};
 use std::{convert::identity, mem::size_of};
-
-pub mod srm_token {
-    solana_program::declare_id!("SRMuApVNdxXokk5GT7XD5cUUgXMBCoAz2LHeuAoKWRt");
-}
-
-pub mod msrm_token {
-    solana_program::declare_id!("MSRMcoVyrFxnSgo5uXwone5SKcGhT1KEJMFEkMEWf9L");
-}
 
 #[cfg(feature = "testnet")]
 pub mod config_feature {
@@ -57,6 +49,10 @@ pub mod config_feature {
     }
     pub mod create_pool_fee_address {
         solana_program::declare_id!("3TRTX4dXUpp2eqxi3tvQDFYUV7SdDJjcPE3Y4mbtftaX");
+    }
+
+    pub mod collect_lamports {
+        solana_program::declare_id!("75KWb5XcqPTgacQyNw9P5QU2HL3xpezEVcgsFCiJgTT");
     }
 }
 #[cfg(feature = "devnet")]
@@ -73,6 +69,9 @@ pub mod config_feature {
     pub mod create_pool_fee_address {
         solana_program::declare_id!("9y8ENuuZ3b19quffx9hQvRVygG5ky6snHfRvGpuSfeJy");
     }
+    pub mod collect_lamports {
+        solana_program::declare_id!("DRaySTrJSn4nD9TF1dLZ7uAGNhUXV5kth6yudWTTx39A");
+    }
 }
 #[cfg(not(any(feature = "testnet", feature = "devnet")))]
 pub mod config_feature {
@@ -87,6 +86,9 @@ pub mod config_feature {
     }
     pub mod create_pool_fee_address {
         solana_program::declare_id!("7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5");
+    }
+    pub mod collect_lamports {
+        solana_program::declare_id!("Rayyxz4cjBTQo7XTT1fhVNqFWK21TjiWcrtPgC3czbL");
     }
 }
 
@@ -319,7 +321,7 @@ impl Processor {
                 associated_seed,
                 &[bump_seed],
             ];
-            let rent = &Rent::from_account_info(rent_sysvar_account)?;
+            let rent = Rent::get()?;
             let required_lamports = rent
                 .minimum_balance(spl_token::state::Account::LEN)
                 .max(1)
@@ -411,7 +413,7 @@ impl Processor {
                 associated_seed,
                 &[bump_seed],
             ];
-            let rent = &Rent::from_account_info(rent_sysvar_account)?;
+            let rent = Rent::get()?;
             let required_lamports = rent
                 .minimum_balance(spl_token::state::Mint::LEN)
                 .max(1)
@@ -480,7 +482,7 @@ impl Processor {
         associated_token_account: &'a AccountInfo<'b>,
         user_wallet_account: &'a AccountInfo<'b>,
         system_program_account: &'a AccountInfo<'b>,
-        rent_sysvar_account: &'a AccountInfo<'b>,
+        _rent_sysvar_account: &'a AccountInfo<'b>,
         associated_seed: &[u8],
         data_size: usize,
     ) -> ProgramResult {
@@ -501,7 +503,7 @@ impl Processor {
                 associated_seed,
                 &[bump_seed],
             ];
-            let rent = &Rent::from_account_info(rent_sysvar_account)?;
+            let rent = Rent::get()?;
             let required_lamports = rent
                 .minimum_balance(data_size)
                 .max(1)
@@ -698,7 +700,7 @@ impl Processor {
         );
         check_assert_eq!(
             *system_program_info.key,
-            solana_program::system_program::id(),
+            solana_system_interface::program::id(),
             "sys_program",
             AmmError::InvalidSysProgramAddress
         );
@@ -2712,12 +2714,11 @@ impl Processor {
         let amm_config_info = next_account_info(account_info_iter)?;
         let pnl_owner_info = next_account_info(account_info_iter)?;
         let system_program_info = next_account_info(account_info_iter)?;
-        let rent_sysvar_info = next_account_info(account_info_iter)?;
 
         if !admin_info.is_signer || config_feature::amm_owner::id() != *admin_info.key {
             return Err(AmmError::InvalidSignAccount.into());
         }
-        if *system_program_info.key != solana_program::system_program::id() {
+        if *system_program_info.key != solana_system_interface::program::id() {
             return Err(AmmError::InvalidSysProgramAddress.into());
         }
 
@@ -2729,7 +2730,7 @@ impl Processor {
             return Err(AmmError::RepeatCreateConfigAccount.into());
         }
         let pda_signer_seeds: &[&[_]] = &[&AMM_CONFIG_SEED, &[bump_seed]];
-        let rent = &Rent::from_account_info(rent_sysvar_info)?;
+        let rent = Rent::get()?;
         let data_size = size_of::<AmmConfig>();
         let required_lamports = rent
             .minimum_balance(data_size)
@@ -2812,21 +2813,192 @@ impl Processor {
         return Ok(());
     }
 
+    /// Processes `process_withdraw_excess_lamports` instruction.
+    pub fn process_withdraw_excess_lamports(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let collect_lamports_info = next_account_info(account_info_iter)?;
+        let amm_authority_info = next_account_info(account_info_iter)?;
+        let token_program_info = next_account_info(account_info_iter)?;
+        if !collect_lamports_info.is_signer
+            || config_feature::collect_lamports::id() != *collect_lamports_info.key
+        {
+            return Err(AmmError::InvalidSignAccount.into());
+        }
+        check_assert_eq!(
+            *token_program_info.key,
+            spl_token::id(),
+            "spl_token_program",
+            AmmError::InvalidSplTokenProgram
+        );
+        let authority = Self::authority_id(program_id, AUTHORITY_AMM, 254u8)?;
+        check_assert_eq!(
+            *amm_authority_info.key,
+            authority,
+            "authority",
+            AmmError::InvalidProgramAddress
+        );
+        while account_info_iter.len() != 0 {
+            let source_account_info = next_account_info(account_info_iter)?;
+            if *source_account_info.owner == spl_token::id() {
+                Self::withdraw_excess_lamports_from_token(
+                    token_program_info,
+                    source_account_info,
+                    collect_lamports_info,
+                    amm_authority_info,
+                    AUTHORITY_AMM,
+                    254u8,
+                )?;
+            } else if source_account_info.owner == program_id {
+                Self::withdraw_excess_lamports_from_program(
+                    source_account_info,
+                    collect_lamports_info,
+                )?;
+            } else {
+                continue;
+            }
+        }
+        return Ok(());
+    }
+
+    fn withdraw_excess_lamports_from_program<'a>(
+        source_account_info: &AccountInfo<'a>,
+        destination_account_info: &AccountInfo<'a>,
+    ) -> Result<(), ProgramError> {
+        let rent = Rent::get()?;
+        let minimum_balance = rent.minimum_balance(source_account_info.data_len());
+        let source_lamports = source_account_info.lamports();
+        let excess_lamports = source_lamports
+            .checked_sub(minimum_balance)
+            .ok_or(ProgramError::InsufficientFunds)?;
+
+        if excess_lamports == 0 {
+            return Ok(());
+        }
+        {
+            let mut source_lamports_ref = source_account_info.try_borrow_mut_lamports()?;
+
+            **source_lamports_ref = source_lamports
+                .checked_sub(excess_lamports)
+                .ok_or(ProgramError::InsufficientFunds)?;
+        }
+        {
+            let mut destination_lamports_ref =
+                destination_account_info.try_borrow_mut_lamports()?;
+
+            **destination_lamports_ref = destination_lamports_ref
+                .checked_add(excess_lamports)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+        return Ok(());
+    }
+
+    fn withdraw_excess_lamports_from_token<'a>(
+        token_program_info: &AccountInfo<'a>,
+        source_account_info: &AccountInfo<'a>,
+        destination_account_info: &AccountInfo<'a>,
+        amm_authority_info: &AccountInfo<'a>,
+        amm_seed: &[u8],
+        nonce: u8,
+    ) -> Result<(), ProgramError> {
+        if source_account_info.data_len() == spl_token::state::Account::LEN {
+            // Token Account
+
+            let (is_native, amount_before_sync) = {
+                let data = source_account_info.try_borrow_data()?;
+                (
+                    data[109] == 1,
+                    u64::from_le_bytes(data[64..72].try_into().unwrap()),
+                )
+            };
+            if is_native {
+                // Native token account, use SyncNative and UnwrapLamports
+
+                // Because directly using UnwrapLamports would affect the native token amount,
+                // we first perform a SyncNative operation to convert all excess lamports into WSOL.
+                // And then compare the difference in the amount before and after the conversion,
+                // and finally perform the UnwrapLamports operation.
+                invoke(
+                    &spl_token::instruction::sync_native(
+                        token_program_info.key,
+                        source_account_info.key,
+                    )?,
+                    &[token_program_info.clone(), source_account_info.clone()],
+                )?;
+
+                let amount_after_sync = {
+                    let data = source_account_info.try_borrow_data()?;
+                    u64::from_le_bytes(data[64..72].try_into().unwrap())
+                };
+                let excess_lamports = amount_after_sync
+                    .checked_sub(amount_before_sync)
+                    .ok_or(ProgramError::InsufficientFunds)?;
+                if excess_lamports == 0 {
+                    return Ok(());
+                } else {
+                    Invokers::unwrap_lamports(
+                        token_program_info.clone(),
+                        source_account_info.clone(),
+                        destination_account_info.clone(),
+                        amm_authority_info.clone(),
+                        amm_seed,
+                        nonce,
+                        Some(excess_lamports),
+                    )?;
+                    let amount_after_unwrap = {
+                        let data = source_account_info.try_borrow_data()?;
+                        u64::from_le_bytes(data[64..72].try_into().unwrap())
+                    };
+                    // Check the amount unchanged before and after these operations.
+                    if amount_before_sync != amount_after_unwrap {
+                        return Err(AmmError::LamportsCalculateError.into());
+                    }
+                }
+            } else {
+                // Not native token account, use WithdrawExcessLamports
+                Invokers::withdraw_excess_lamports(
+                    token_program_info.clone(),
+                    source_account_info.clone(),
+                    destination_account_info.clone(),
+                    amm_authority_info.clone(),
+                    amm_seed,
+                    nonce,
+                )?;
+            }
+        } else {
+            // Mint Account, use WithdrawExcessLamports
+            Invokers::withdraw_excess_lamports(
+                token_program_info.clone(),
+                source_account_info.clone(),
+                destination_account_info.clone(),
+                amm_authority_info.clone(),
+                amm_seed,
+                nonce,
+            )?;
+        }
+        return Ok(());
+    }
+
     /// Processes an [Instruction](enum.Instruction.html).
     pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], input: &[u8]) -> ProgramResult {
         let instruction = AmmInstruction::unpack(input)?;
         match instruction {
             AmmInstruction::PreInitialize(_init_arg) => {
-                unimplemented!("This instruction is not supported, please use Initialize2")
+                msg!("This instruction is not supported, please use Initialize2");
+                return Err(AmmError::InvalidInstruction.into());
             }
             AmmInstruction::Initialize(_init1) => {
-                unimplemented!("This instruction is not supported, please use Initialize2")
+                msg!("This instruction is not supported, please use Initialize2");
+                return Err(AmmError::InvalidInstruction.into());
             }
             AmmInstruction::Initialize2(init2) => {
                 Self::process_initialize2(program_id, accounts, init2)
             }
             AmmInstruction::MonitorStep(_monitor) => {
-                unimplemented!("This instruction is not supported")
+                msg!("This instruction is not supported");
+                return Err(AmmError::InvalidInstruction.into());
             }
             AmmInstruction::Deposit(deposit) => {
                 Self::process_deposit(program_id, accounts, deposit)
@@ -2835,14 +3007,16 @@ impl Processor {
                 Self::process_withdraw(program_id, accounts, withdraw)
             }
             AmmInstruction::MigrateToOpenBook => {
-                unimplemented!("This instruction is not supported")
+                msg!("This instruction is not supported");
+                return Err(AmmError::InvalidInstruction.into());
             }
             AmmInstruction::SetParams(setparams) => {
                 Self::process_set_params(program_id, accounts, setparams)
             }
             AmmInstruction::WithdrawPnl => Self::process_withdrawpnl(program_id, accounts),
             AmmInstruction::WithdrawSrm(_withdrawsrm) => {
-                unimplemented!("This instruction is not supported")
+                msg!("This instruction is not supported");
+                return Err(AmmError::InvalidInstruction.into());
             }
             AmmInstruction::SwapBaseIn(swap) => {
                 Self::process_swap_base_in(program_id, accounts, swap)
@@ -2851,10 +3025,12 @@ impl Processor {
                 Self::process_swap_base_out(program_id, accounts, swap)
             }
             AmmInstruction::SimulateInfo(_simulate) => {
-                unimplemented!("This instruction is not supported")
+                msg!("This instruction is not supported");
+                return Err(AmmError::InvalidInstruction.into());
             }
             AmmInstruction::AdminCancelOrders(_cancel) => {
-                unimplemented!("This instruction is not supported")
+                msg!("This instruction is not supported");
+                return Err(AmmError::InvalidInstruction.into());
             }
             AmmInstruction::CreateConfigAccount => {
                 Self::process_create_config(program_id, accounts)
@@ -2867,6 +3043,9 @@ impl Processor {
             }
             AmmInstruction::SwapBaseOutV2(swap) => {
                 Self::process_swap_base_out_v2(program_id, accounts, swap)
+            }
+            AmmInstruction::WithdrawExcessLamports => {
+                Self::process_withdraw_excess_lamports(program_id, accounts)
             }
         }
     }
